@@ -18,7 +18,8 @@
  *
  * @section DESCRIPTION
  *
- * TL2 implementation.
+ * Software Transactional Memory (STM) implementation using
+ * Transactional Locking (TL2) algorithm.
 **/
 
 #define _GNU_SOURCE
@@ -30,8 +31,6 @@
 // External headers
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
-#include <stdatomic.h>
 
 // Internal headers
 #include <tm.h>
@@ -45,7 +44,6 @@
 struct segment_node {
     struct segment_node* prev;
     struct segment_node* next;
-    // uint8_t segment[] // segment of dynamic size
 };
 typedef struct segment_node* segment_list;
 
@@ -53,82 +51,79 @@ typedef struct segment_node* segment_list;
  * @brief Simple Shared Memory Region (a.k.a Transactional Memory).
  */
 struct region {
-    struct shared_lock_t lock; // Global lock
-    void* start;        // Start of the shared memory region (i.e., of the non-deallocable memory segment)
-    segment_list allocs; // Shared memory segments dynamically allocated via tm_alloc within transactions
-    size_t size;        // Size of the non-deallocable memory segment (in bytes)
-    size_t align;       // Size of a word in the shared memory region (in bytes)
+    struct shared_lock_t lock;  // Global lock
+    void* start;                // Start of the shared memory region (i.e., of the non-deallocable memory segment)
+    segment_list allocs;        // Shared memory segments dynamically allocated via tm_alloc within transactions
+    size_t size;                // Size of the non-deallocable memory segment (in bytes)
+    size_t align;               // Size of a word in the shared memory region (in bytes)
 };
 
 
 
+// Start of helper functions used to implement TL2
 
-// HELPER FUNCS START
-
-void unlock_write_set(struct shared_lock_t* lock, struct write_node* first_write_node, void* next_to_lock) {
-    // printf("unlock_write_set() called.\n");
-    struct write_node* iterator = first_write_node;
-    int count = 0;
-    while (iterator != next_to_lock) {
-        shared_lock_versioned_spinlock_release(lock, iterator->address);
-        iterator = iterator->next; 
-        count++;
+/** Unlock the written memory addresses.
+ * @param lock              Global lock object stored in region
+ * @param first_write_node  Pointer to the write node which contains the first memory address that needs to be unlocked
+ * @param next_to_lock      Pointer to the write node which contains the last memory address that needs to be unlocked
+ *                          -(NULL if all addresses stored in write set need to be unlocked)
+**/
+void unlock_write_set(struct shared_lock_t* lock, struct write_node* first_write_node, struct write_node* next_to_lock) {
+    while (first_write_node != next_to_lock) {
+        shared_lock_versioned_spinlock_release(lock, first_write_node->address);
+        first_write_node = first_write_node->next; 
     }
-    // printf("unlock_write_set() terminated (unlocked %d locks).\n", count);
 }
 
+/** Lock the written memory addresses.
+ * @param lock              Global lock object stored in region
+ * @param first_write_node  Pointer to the write node which contains the first memory address that needs to be locked
+ * @return Whether the all the written addresses were locked successfully or not
+**/
 bool lock_write_set(struct shared_lock_t* lock, struct write_node* first_write_node) {
-    // printf("lock_write_set() called.\n");
-    struct write_node* iterator = first_write_node;
-    int count = 0;
-    while (iterator != NULL) {
-        if (!shared_lock_versioned_spinlock_acquire(lock, iterator->address)) {
-            unlock_write_set(lock, first_write_node, iterator);
-            // printf("lock_write_set() terminated : return false (locked %d locks).\n", count);
-            iterator = first_write_node;
-            while (iterator != NULL) {
-                iterator = iterator->next;
-            }
+    struct write_node* begin = first_write_node;
+    while (first_write_node != NULL) {
+        if (!shared_lock_versioned_spinlock_acquire(lock, first_write_node->address)) {
+            unlock_write_set(lock, begin, first_write_node);
             return false;
         }
-        iterator = iterator->next;
-        count++;
+        first_write_node = first_write_node->next;
     }
-
-    // printf("lock_write_set() terminated : return true (locked %d locks).\n", count);
     return true;
 }
 
+/** Validate the read memory addresses.
+ * @param lock              Global lock object stored in region
+ * @param first_read_node  Pointer to the read node which contains the first memory address that needs to be validated
+ * @param rv                Read version (according to TL2 algorithm)
+ * @return Whether the all the read addresses were validated successfully or not
+**/
 bool validate_read_set(struct shared_lock_t* lock, struct read_node* first_read_node, int rv) {
-    // printf("validate_read_set() called.\n");
-    struct read_node* iterator = first_read_node;
-    while (iterator != NULL) {
-        if (!shared_lock_versioned_spinlock_validate(lock, iterator->address, rv)) {
-            // printf("validate_read_set() terminated : return false.\n");
+    while (first_read_node != NULL) {
+        if (!shared_lock_versioned_spinlock_validate(lock, first_read_node->address, rv)) {
             return false;
         }
-        iterator = iterator->next;
+        first_read_node = first_read_node->next;
     }
-    // printf("validate_read_set() terminated : return true.\n");
     return true;
 }
 
+/** Store the written data to the shared memory region.
+ * @param lock              Global lock object stored in region
+ * @param first_write_node  Pointer to the write node which contains the first memory address and the value written to it
+ * @param size              Size of the memory region to be copied (equal to the alignment of the region)
+ * @param wv                Write version (according to TL2 algorithm)
+**/
 void store_write_set(struct shared_lock_t* lock, struct write_node* first_write_node, size_t size, int wv) {
-    // printf("store_write_set() called.\n");
-    struct write_node* iterator = first_write_node;
-    int count = 0;
-    while (iterator != NULL) {
-        memcpy(iterator->address, iterator->value, size);
-        shared_lock_versioned_spinlock_update(lock, iterator->address, wv);
-        shared_lock_versioned_spinlock_release(lock, iterator->address);
-        iterator = iterator->next;
-        count++;
+    while (first_write_node != NULL) {
+        memcpy(first_write_node->address, first_write_node->value, size);
+        shared_lock_versioned_spinlock_update(lock, first_write_node->address, wv);
+        shared_lock_versioned_spinlock_release(lock, first_write_node->address);
+        first_write_node = first_write_node->next;
     }
-    // printf("store_write_set() terminated (unlocked %d locks).\n", count);
 }
 
-// HELPER FUNCS END
-
+// End of helper functions used to implement TL2
 
 
 
@@ -138,30 +133,22 @@ void store_write_set(struct shared_lock_t* lock, struct write_node* first_write_
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
 shared_t tm_create(size_t size, size_t align) {
-    printf("tm_create() called.\n");
     struct region* region = (struct region*) malloc(sizeof(struct region));
 
     if (unlikely(!region)) {
-        printf("tm_create() terminated : return invalid_shared (malloc fail).\n");
         return invalid_shared;
     }
-    // We allocate the shared memory buffer such that its words are correctly
-    // aligned.
-    if (posix_memalign(&(region->start), align, size) != 0) {
+
+    if (unlikely(posix_memalign(&(region->start), align, size) != 0)) {
         free(region);
-        printf("tm_create() terminated : return invalid_shared (posix_memalign fail).\n");
         return invalid_shared;
     }
 
     shared_lock_init(&(region->lock));
-    
     memset(region->start, 0, size);
-
     region->allocs      = NULL;
     region->size        = size;
     region->align       = align;
-
-    printf("tm_create() terminated : return region.\n");
     return region;
 }
 
@@ -169,20 +156,17 @@ shared_t tm_create(size_t size, size_t align) {
  * @param shared Shared memory region to destroy, with no running transaction
 **/
 void tm_destroy(shared_t shared) {
-    // Note: To be compatible with any implementation, shared_t is defined as a
-    // void*. For this particular implementation, the "real" type of a shared_t
-    // is a struct region*.
-    printf("tm_destroy () called.\n");
     struct region* region = (struct region*) shared;
+
     while (region->allocs) { // Free allocated segments
         segment_list tail = region->allocs->next;
         free(region->allocs);
         region->allocs = tail;
     }
+
+    shared_lock_cleanup(&region->lock);
     free(region->start);
     free(region);
-
-    printf("tm_destroy() terminated.\n");
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -190,8 +174,6 @@ void tm_destroy(shared_t shared) {
  * @return Start address of the first allocated segment
 **/
 void* tm_start(shared_t shared) {
-    // printf("tm_start() called.\n");
-    // printf("tm_start() terminated : return start.\n");
     return ((struct region*) shared)->start;
 }
 
@@ -200,8 +182,6 @@ void* tm_start(shared_t shared) {
  * @return First allocated segment size
 **/
 size_t tm_size(shared_t shared) {
-    // printf("tm_size() called.\n");
-    // printf("tm_size() terminated : return size.\n");
     return ((struct region*) shared)->size;
 }
 
@@ -210,8 +190,6 @@ size_t tm_size(shared_t shared) {
  * @return Alignment used globally
 **/
 size_t tm_align(shared_t shared) {
-    // printf("tm_align() called.\n");
-    // printf("tm_align() terminated : return align.\n");
     return ((struct region*) shared)->align;
 }
 
@@ -221,21 +199,17 @@ size_t tm_align(shared_t shared) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
-    // printf("tm_begin() called.\n");
     struct region* region = (struct region*) shared;
+
     struct transaction* transaction = (struct transaction*) malloc(sizeof(struct transaction));
 
     if (unlikely(!transaction)) {
-        printf("tm_begin() terminated : return invalid_tx.\n");
         return invalid_tx;
     }
 
     transaction_init(transaction, is_ro);
-
-    transaction->rv = shared_lock_global_clock_get(&region->lock);
-
-    // printf("tm_begin() terminated : return transaction.\n");
-    return (tx_t)transaction;
+    transaction->rv = shared_lock_global_clock_get(&region->lock); // Sample the global clock and store it as read version
+    return (tx_t)transaction; // Return a pointer to the transaction
 }
 
 /** [thread-safe] End the given transaction.
@@ -244,41 +218,33 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t tx) {
-    // printf("tm_end() called.\n");
-    struct region* region = (struct region*) shared;
     struct transaction* transaction = (struct transaction*) tx;
 
-    if (!transaction->is_ro) {
-        // printf("tm_end() read-write.\n");
-        if (!lock_write_set(&region->lock, transaction->first_write_node)) {
+    if (!transaction->is_ro) { // if it is a read-write transaction
+        struct region* region = (struct region*) shared;
+
+        if (!lock_write_set(&region->lock, transaction->first_write_node)) { // Attempt to lock the write set
             transaction_cleanup(transaction);
             free(transaction);
-            // printf("tm_end() terminated : return false (lock write set failed).\n");
             return false;
         }
 
-        int wv = shared_lock_global_clock_increment_and_get(&region->lock);
+        int wv = shared_lock_global_clock_increment_and_get(&region->lock); // Sample the global clock and store it as write version
 
-        if (wv != transaction->rv + 1) {
-            if (!validate_read_set(&region->lock, transaction->first_read_node, transaction->rv)) {
+        if (wv != transaction->rv + 1) { // If write version is 1 more than read version, we do not need to perform any other validations
+            if (!validate_read_set(&region->lock, transaction->first_read_node, transaction->rv)) { // Otherwise, we attempt to validate the read set
                 unlock_write_set(&region->lock, transaction->first_write_node, NULL);
                 transaction_cleanup(transaction);
                 free(transaction);
-                // printf("tm_end() terminated : return false (validate read set failed).\n");
                 return false;
             }
         }
-
-        store_write_set(&region->lock, transaction->first_write_node, region->align, wv); //commit
-
+        
+        store_write_set(&region->lock, transaction->first_write_node, region->align, wv); // Commit changes
         transaction_cleanup(transaction);
-        free(transaction);
-    }
-    else {
-        // printf("tm_end() read-only (do nothing).\n");
-        free(transaction);
     }
 
+    free(transaction);
     return true;
 }
 
@@ -291,63 +257,44 @@ bool tm_end(shared_t shared, tx_t tx) {
  * @return Whether the whole transaction can continue
 **/
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
-    // printf("tm_read() called : source=%p.\n", source);
-
     struct region* region = (struct region*) shared;
     struct transaction* transaction = (struct transaction*) tx;
 
-    int num_segments = size / region->align;
-    // printf("tm_read() number of segments is %d.\n", num_segments);
-
-    for (int i = 0; i < num_segments; i++) {
-        // printf("tm_read() processing segment %d.\n", i);
-
-        const void* cur_segment = source + i * region->align;
-        void* cur_target = target + i * region->align;
-
-        int pre_version = shared_lock_versioned_spinlock_get(&region->lock, cur_segment);
-
-        if (transaction->is_ro) { //if it is a read-only transaction
-            // printf("tm_read() read-only.\n");
-            memcpy(cur_target, cur_segment, region->align);
+    size_t num_bytes_read = 0;
+    const void* source_word = source;
+    void* target_word = target;
+    do
+    {
+        if (transaction->is_ro) { // If it is a read-only transaction
+            memcpy(target_word, source_word, region->align);
         }
-        else { //otherwise
-            // printf("tm_read() read-write.\n");
-            struct write_node* old_node = (struct write_node*)bloom_filter_get(&transaction->bloom_filter, cur_segment);
+        else { // If it is a read-write transaction
+            struct write_node* old_node = write_node_find(transaction->first_write_node, source_word);
 
-            if (old_node == NULL) { //it is not in the write set
-                // printf("tm_read() bloom filter miss.\n");
-                if (!read_set_add(&transaction->first_read_node, &transaction->last_read_node, cur_segment)) {
-                    printf("tm_read() terminated : return false (read_set_add()).\n");
+            if (old_node == NULL) { // If the address we are trying to read is not in the write set
+                if (unlikely(!read_set_add(&transaction->first_read_node, &transaction->last_read_node, source_word))) {
                     transaction_cleanup(transaction);
                     free(transaction);
                     return false;
                 }
-                memcpy(cur_target, cur_segment, region->align);
+                memcpy(target_word, source_word, region->align);
             }
-            else { //it is in the write set
-                // printf("tm_read() bloom filter hit.\n");
-                memcpy(cur_target, old_node->value, region->align);
+            else { // If the address we are trying to read is in the write set
+                memcpy(target_word, old_node->value, region->align);
             }
         }
 
-        int post_version = shared_lock_versioned_spinlock_get(&region->lock, cur_segment);
-
-        if (post_version != pre_version) {
-            // printf("tm_read() terminated : return false (version conflict).\n");
+        if (!shared_lock_versioned_spinlock_validate(&region->lock, source_word, transaction->rv)) { // Attempt to validate the address we read
             transaction_cleanup(transaction);
             free(transaction);
             return false;
         }
 
-        if (!shared_lock_versioned_spinlock_validate(&region->lock, cur_segment, transaction->rv)) {
-            // printf("tm_read() terminated : return false (lock validation fail).\n");
-            transaction_cleanup(transaction);
-            free(transaction);
-            return false;
-        }
-    }
-    // printf("tm_read() terminated : return true.\n");
+        source_word += region->align;
+        target_word += region->align;
+        num_bytes_read += region->align;
+    } while (num_bytes_read < size); // Check if we have read the requested number of bytes
+
     return true;
 }
 
@@ -360,40 +307,33 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
  * @return Whether the whole transaction can continue
 **/
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
-    // printf("tm_write() called : target=%p.\n", target);
-
     struct region* region = (struct region*) shared;
     struct transaction* transaction = (struct transaction*) tx;
 
-    int num_segments = size / region->align;
-    // printf("tm_write() number of segments is %d.\n", num_segments);
+    size_t num_bytes_read = 0;
+    const void* source_word = source;
+    void* target_word = target;
 
-    for (int i = 0; i < num_segments; i++) {
-        // printf("tm_write() processing segment %d.\n", i);
+    do
+    {
+        struct write_node* old_node = write_node_find(transaction->first_write_node, target_word);
 
-        void* cur_segment = target + i * region->align;
-        const void* cur_source = source + i * region->align;
-
-        // printf("tm_write() checkpoint1.\n");
-        struct write_node* old_node = (struct write_node*)bloom_filter_get(&transaction->bloom_filter, cur_segment);
-        // printf("tm_write() checkpoint2.\n");
-
-        if (old_node == NULL) { //new write
-            // printf("tm_write() creating new write node.\n");
-            if (!write_set_add(&transaction->first_write_node, &transaction->last_write_node, cur_segment, cur_source, region->align)) {
-                printf("tm_write() terminated : return false.\n");
+        if (old_node == NULL) { // If the address we are trying to write is not in the write set
+            if (unlikely(!write_set_add(&transaction->first_write_node, &transaction->last_write_node, target_word, source_word, region->align))) {
                 transaction_cleanup(transaction);
                 free(transaction);
                 return false;
             }
-            bloom_filter_add(&transaction->bloom_filter, cur_segment, (void*)(transaction->last_write_node));
         }
-        else { //overwrite
-            // printf("tm_write() overwriting old write node.\n");
-            write_node_overwrite(old_node, cur_source, region->align);
+        else { // If the address we are trying to write is in the write set
+            write_node_overwrite(old_node, source_word, region->align);
         }
-    }
-    // printf("tm_write() terminated : return true.\n");
+
+        source_word += region->align;
+        target_word += region->align;
+        num_bytes_read += region->align;
+    } while (num_bytes_read < size); // Check if we have written the requested number of bytes
+    
     return true;
 }
 
@@ -404,10 +344,29 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void** unused(target)) {
-    printf("tm_alloc() called.\n");
-    printf("tm_alloc() terminated : return abort_alloc.\n");
-    return abort_alloc;
+alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
+    struct region* region = (struct region*) shared;
+
+    size_t align = region->align;
+    align = align < sizeof(struct segment_node*) ? sizeof(void*) : align;
+
+    struct segment_node* sn;
+    if (unlikely(posix_memalign((void**)&sn, align, sizeof(struct segment_node) + size) != 0)) {
+        return nomem_alloc;
+    }
+    sn->prev = NULL;
+
+    shared_lock_segment_lock_acquire(&region->lock); // Only one transaction is allowed to add allocated segments to the region at a time
+    sn->next = region->allocs;
+    if (sn->next) sn->next->prev = sn;
+    region->allocs = sn;
+    shared_lock_segment_lock_release(&region->lock);
+
+    void* segment = (void*) ((uintptr_t) sn + sizeof(struct segment_node));
+    memset(segment, 0, size);
+    *target = segment;
+
+    return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -417,7 +376,5 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(segment)) {
-    printf("tm_free() called.\n");
-    printf("tm_free() terminated : return false.\n");
-    return false;
+    return true; // No need to free anything here. All the allocated segments will be freed upon tm_destroy call
 }

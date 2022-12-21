@@ -5,6 +5,7 @@ void shared_lock_init(struct shared_lock_t* lock) {
     for (int i = 0; i < NUM_LOCKS; i++) {
         versioned_spinlock_init(&lock->locks[i]);
     }
+    pthread_mutex_init(&lock->segment_lock, NULL);
 }
 
 int shared_lock_global_clock_get(struct shared_lock_t* lock) {
@@ -12,7 +13,6 @@ int shared_lock_global_clock_get(struct shared_lock_t* lock) {
 }
 
 int shared_lock_global_clock_increment_and_get(struct shared_lock_t* lock) {
-    //is there a regular version of this fn???
     return __atomic_add_fetch(&lock->clock, 1, __ATOMIC_RELAXED);
 }
 
@@ -28,10 +28,6 @@ void shared_lock_versioned_spinlock_release(struct shared_lock_t* lock, const vo
     versioned_spinlock_release(&lock->locks[find_lock(shared)]);
 }
 
-int shared_lock_versioned_spinlock_get(struct shared_lock_t* lock, const void* shared) {
-    return versioned_spinlock_get(&lock->locks[find_lock(shared)]);
-}
-
 void shared_lock_versioned_spinlock_update(struct shared_lock_t* lock, const void* shared, int version) {
     versioned_spinlock_update(&lock->locks[find_lock(shared)], version);
 }
@@ -41,9 +37,13 @@ bool shared_lock_versioned_spinlock_validate(struct shared_lock_t* lock, const v
 }
 
 void shared_lock_segment_lock_acquire(struct shared_lock_t* lock) {
-    while (!versioned_spinlock_acquire(&lock->segment_lock)) {}
+    pthread_mutex_lock(&lock->segment_lock);
 }
 
 void shared_lock_segment_lock_release(struct shared_lock_t* lock) {
-    versioned_spinlock_release(&lock->segment_lock);
+    pthread_mutex_unlock(&lock->segment_lock);
+}
+
+void shared_lock_cleanup(struct shared_lock_t* lock) {
+    pthread_mutex_destroy(&lock->segment_lock);
 }
